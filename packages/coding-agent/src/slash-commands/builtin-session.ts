@@ -136,6 +136,76 @@ async function handleSessionPinCommand(
 	await output(`Pinned ${account.label} to this session for ${providerName}.`);
 }
 
+async function handleSessionOrderCommand(
+	arg: string,
+	session: AgentSession,
+	output: SlashCommandRuntime["output"],
+): Promise<void> {
+	let accountList: SessionOAuthAccountList | undefined;
+	try {
+		accountList = await session.listCurrentProviderOAuthAccounts();
+	} catch (error) {
+		await output(`Could not load provider accounts: ${errorMessage(error)}`);
+		return;
+	}
+	if (!accountList) {
+		await output("Select a model before ordering provider accounts.");
+		return;
+	}
+	const provider = getOAuthProviders().find(candidate => candidate.id === accountList.provider);
+	const providerName = provider?.name ?? accountList.provider;
+	// Accounts arrive in current priority order, and the overlay renders the same
+	// list, so the 1-based positions typed here match the rows it shows.
+	const accounts = toSessionPinAccounts(accountList.accounts);
+	if (accounts.length < 2) {
+		await output(
+			accounts.length === 0
+				? `No OAuth accounts for ${providerName}. Use /login to add one.`
+				: `Only one OAuth account for ${providerName} — nothing to order.`,
+		);
+		return;
+	}
+
+	const positions = arg
+		.trim()
+		.split(/[\s,]+/)
+		.filter(Boolean);
+	if (positions.length === 0) {
+		const lines = [`${providerName} account priority (top = default):`];
+		accounts.forEach((account, index) => {
+			lines.push(`${index + 1}. ${account.label}`);
+		});
+		lines.push(
+			"",
+			"Reorder with `/session order <pos> <pos> …` (1-based, best first); omitted accounts keep their order.",
+		);
+		await output(lines.join("\n"));
+		return;
+	}
+
+	const ranked: number[] = [];
+	const seen = new Set<number>();
+	for (const token of positions) {
+		const position = Number(token);
+		if (!Number.isInteger(position) || position < 1 || position > accounts.length) {
+			await output(`Invalid position "${token}". Use numbers 1-${accounts.length}.`);
+			return;
+		}
+		const credentialId = accounts[position - 1]!.credentialId;
+		if (seen.has(credentialId)) continue;
+		seen.add(credentialId);
+		ranked.push(credentialId);
+	}
+	for (const account of accounts) {
+		if (!seen.has(account.credentialId)) ranked.push(account.credentialId);
+	}
+	if (!session.setCurrentProviderSubscriptionOrder(ranked)) {
+		await output("Select a model before ordering provider accounts.");
+		return;
+	}
+	await output(`Saved ${providerName} account priority order.`);
+}
+
 export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "todo",
@@ -180,7 +250,7 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		icon: "session",
 		description: "Session management commands",
 		acpDescription: "Show or configure the current session",
-		acpInputHint: "[info|delete|pin [account]]",
+		acpInputHint: "[info|delete|pin [account]|order [positions]]",
 		subcommands: [
 			{ name: "info", description: "Show session info and stats" },
 			{ name: "delete", description: "Delete current session and return to selector" },
@@ -188,6 +258,11 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				name: "pin",
 				description: "Pin the current provider to a stored OAuth account",
 				usage: "[account]",
+			},
+			{
+				name: "order",
+				description: "Order the current provider's OAuth accounts by priority",
+				usage: "[positions]",
 			},
 		],
 		allowArgs: true,
@@ -226,7 +301,11 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				await handleSessionPinCommand(rest, runtime.session, runtime.output);
 				return commandConsumed();
 			}
-			return usage("Usage: /session [info|delete|pin [account]]", runtime);
+			if (verb === "order") {
+				await handleSessionOrderCommand(rest, runtime.session, runtime.output);
+				return commandConsumed();
+			}
+			return usage("Usage: /session [info|delete|pin [account]|order [positions]]", runtime);
 		},
 		handleTui: async (command, runtime) => {
 			const { verb, rest } = parseSubcommand(command.args);
@@ -245,10 +324,20 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				runtime.ctx.editor.setText("");
 				return;
 			}
+			if (verb === "order") {
+				if (rest) {
+					await handleSessionOrderCommand(rest, runtime.ctx.session, text => runtime.ctx.showStatus(text));
+					refreshStatusLine(runtime.ctx);
+				} else {
+					await runtime.ctx.showSubscriptionOrderSelector();
+				}
+				runtime.ctx.editor.setText("");
+				return;
+			}
 			if (!verb || (verb === "info" && !rest)) {
 				await runtime.ctx.handleSessionCommand();
 			} else {
-				runtime.ctx.showStatus("Usage: /session [info|delete|pin [account]]");
+				runtime.ctx.showStatus("Usage: /session [info|delete|pin [account]|order [positions]]");
 			}
 			runtime.ctx.editor.setText("");
 		},

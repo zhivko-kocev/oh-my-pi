@@ -5689,6 +5689,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#selectorController.showSessionPinSelector();
 	}
 
+	showSubscriptionOrderSelector(): Promise<void> {
+		return this.#selectorController.showSubscriptionOrderSelector();
+	}
+
 	showResetUsageSelector(): Promise<void> {
 		return this.#selectorController.showResetUsageSelector();
 	}

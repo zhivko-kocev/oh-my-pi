@@ -7,6 +7,12 @@ import { type AuthCredentialStore, AuthStorage, SqliteAuthCredentialStore } from
 import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 
 const PROVIDER = "unit-oauth-select";
+/**
+ * A session id whose credential rotation slot is 2 of 3 (`Bun.hash.xxHash32`
+ * modulo the account count), so a rotation-seeded start is observably different
+ * from a priority-seeded one.
+ */
+const SESSION_HASH_SLOT_2 = "order-seed";
 
 function oauthCredential(suffix: string) {
 	return {
@@ -17,6 +23,13 @@ function oauthCredential(suffix: string) {
 		accountId: `acc-${suffix}`,
 		email: `${suffix}@example.com`,
 	};
+}
+
+/** Durable row id of the stored account carrying `accountId`. */
+function credentialIdFor(storage: AuthStorage, accountId: string): number {
+	const account = storage.listOAuthAccounts(PROVIDER).find(candidate => candidate.accountId === accountId);
+	if (!account) throw new Error(`missing stored account ${accountId}`);
+	return account.credentialId;
 }
 
 describe("AuthStorage OAuth account selection", () => {
@@ -200,5 +213,114 @@ describe("AuthStorage OAuth account selection", () => {
 		expect("accessToken" in result).toBe(false);
 		// Target-only: no sibling credential was refreshed/rotated on the failure path.
 		expect(seen).toEqual(["access-b"]);
+	});
+
+	test("subscription order resolver reorders account listing", async () => {
+		const storage = authStorage;
+		if (!storage) throw new Error("test setup failed");
+		await storage.set(PROVIDER, [oauthCredential("a"), oauthCredential("b"), oauthCredential("c")]);
+
+		// Ids must be read before the resolver is installed: reading them through
+		// listOAuthAccounts is what the resolver would otherwise recurse into.
+		const idC = credentialIdFor(storage, "acc-c");
+		const idA = credentialIdFor(storage, "acc-a");
+		// Rank c first, a second; b is unranked and must stay after the ranked ones.
+		storage.setSubscriptionOrderResolver(provider => (provider === PROVIDER ? [idC, idA] : undefined));
+		const ordered = storage.listOAuthAccounts(PROVIDER);
+		expect(ordered.map(account => account.accountId)).toEqual(["acc-c", "acc-a", "acc-b"]);
+		expect(ordered.map(account => account.position)).toEqual([0, 1, 2]);
+
+		// Clearing the resolver restores stable storage order.
+		storage.setSubscriptionOrderResolver(undefined);
+		expect(storage.listOAuthAccounts(PROVIDER).map(account => account.accountId)).toEqual([
+			"acc-a",
+			"acc-b",
+			"acc-c",
+		]);
+	});
+
+	test("subscription order changes which account the top position resolves to", async () => {
+		const storage = authStorage;
+		if (!storage) throw new Error("test setup failed");
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+			const credential = credentials[provider];
+			return credential ? { newCredentials: credential, apiKey: credential.access } : null;
+		});
+		await storage.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		const idB = credentialIdFor(storage, "acc-b");
+
+		storage.setSubscriptionOrderResolver(() => [idB]);
+		const top = await storage.getOAuthAccessAt(PROVIDER, 0);
+		expect(top?.ok).toBe(true);
+		if (!top?.ok) throw new Error("expected successful resolution");
+		expect(top.accountId).toBe("acc-b");
+	});
+
+	test("subscription order seeds a fresh session's selection without a ranking strategy", async () => {
+		const storage = authStorage;
+		if (!storage) throw new Error("test setup failed");
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+			const credential = credentials[provider];
+			return credential ? { newCredentials: credential, apiKey: credential.access } : null;
+		});
+		await storage.set(PROVIDER, [oauthCredential("a"), oauthCredential("b"), oauthCredential("c")]);
+		const idC = credentialIdFor(storage, "acc-c");
+
+		// Ranking c first makes the priority order [c, a, b]. This session's hash
+		// slot is 2 (xxHash32("order-seed") % 3), so a rotation-seeded start would
+		// pick the LOWEST-priority entry (acc-b) instead of the user's top choice.
+		storage.setSubscriptionOrderResolver(() => [idC]);
+		expect((await storage.getOAuthAccess(PROVIDER, SESSION_HASH_SLOT_2))?.accountId).toBe("acc-c");
+	});
+
+	test("session rotation still seeds selection when no subscription order is configured", async () => {
+		const storage = authStorage;
+		if (!storage) throw new Error("test setup failed");
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+			const credential = credentials[provider];
+			return credential ? { newCredentials: credential, apiKey: credential.access } : null;
+		});
+		await storage.set(PROVIDER, [oauthCredential("a"), oauthCredential("b"), oauthCredential("c")]);
+
+		// Same session, same hash slot 2 — with no user order the rotation decides.
+		expect((await storage.getOAuthAccess(PROVIDER, SESSION_HASH_SLOT_2))?.accountId).toBe("acc-c");
+	});
+
+	test("a session pin survives a reorder that moves it off the top", async () => {
+		const storage = authStorage;
+		if (!storage) throw new Error("test setup failed");
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+			const credential = credentials[provider];
+			return credential ? { newCredentials: credential, apiKey: credential.access } : null;
+		});
+		await storage.set(PROVIDER, [oauthCredential("a"), oauthCredential("b"), oauthCredential("c")]);
+		const targetId = credentialIdFor(storage, "acc-b");
+		expect(storage.pinSessionOAuthAccount(PROVIDER, "session-reorder", targetId)).toBe(true);
+
+		// The pin is bookkept against the durable row, not the listing position:
+		// reordering acc-b to the bottom must not repoint it at a sibling.
+		const order = [credentialIdFor(storage, "acc-c"), credentialIdFor(storage, "acc-a")];
+		storage.setSubscriptionOrderResolver(() => order);
+
+		const accounts = storage.listOAuthAccounts(PROVIDER, "session-reorder");
+		expect(accounts.map(account => account.accountId)).toEqual(["acc-c", "acc-a", "acc-b"]);
+		expect(accounts.find(account => account.active)?.credentialId).toBe(targetId);
+		const resolved = await storage.getOAuthAccess(PROVIDER, "session-reorder");
+		expect(resolved?.accountId).toBe("acc-b");
+		expect(resolved?.accessToken).toBe("access-b");
+	});
+
+	test("the pre-sticky default account is the priority-top one, not the first stored", async () => {
+		const storage = authStorage;
+		if (!storage) throw new Error("test setup failed");
+		await storage.set(PROVIDER, [oauthCredential("a"), oauthCredential("b")]);
+		const idB = credentialIdFor(storage, "acc-b");
+		storage.setSubscriptionOrderResolver(() => [idB]);
+
+		// No session has resolved or pinned yet, so every "which account am I on"
+		// read must name the same account the listing calls the default.
+		expect(storage.listOAuthAccounts(PROVIDER)[0]?.accountId).toBe("acc-b");
+		expect(storage.getOAuthAccountId(PROVIDER, "session-unresolved")).toBe("acc-b");
+		expect(storage.getOAuthAccountIdentity(PROVIDER, "session-unresolved")?.email).toBe("b@example.com");
 	});
 });

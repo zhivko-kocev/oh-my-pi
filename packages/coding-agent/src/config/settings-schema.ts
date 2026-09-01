@@ -400,6 +400,7 @@ export interface ModelTagsSettings {
 const EMPTY_STRING_ARRAY: string[] = [];
 const EMPTY_STRING_RECORD: Record<string, string> = {};
 const EMPTY_NUMBER_RECORD: Record<string, number> = {};
+const EMPTY_NUMBER_ARRAY_RECORD: Record<string, number[]> = {};
 const DEFAULT_CYCLE_ORDER: string[] = ["smol", "default", "slow"];
 const DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS: string[] = ["hub"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
@@ -601,6 +602,14 @@ export const SETTINGS_SCHEMA = {
 	enabledModels: { type: "array", default: EMPTY_STRING_ARRAY },
 
 	disabledProviders: { type: "array", default: EMPTY_STRING_ARRAY },
+
+	/**
+	 * User-defined OAuth-account priority order per provider, stored as ordered
+	 * credential ids (first = highest priority / active account). Biases the
+	 * account listing and credential selection; managed via `/session order`.
+	 * Not shown in the settings panel — credential ids are opaque.
+	 */
+	"auth.subscriptionOrder": { type: "record", default: EMPTY_NUMBER_ARRAY_RECORD },
 
 	"providers.maxInFlightRequests": {
 		type: "record",

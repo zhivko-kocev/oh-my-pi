@@ -66,7 +66,7 @@ export default class Token extends Command {
 		}),
 		account: Flags.integer({
 			char: "a",
-			description: "Select the Nth OAuth account (1-based) in stored order instead of the round-robin default",
+			description: "Select the Nth OAuth account (1-based) in priority order instead of the round-robin default",
 		}),
 		list: Flags.boolean({
 			char: "l",

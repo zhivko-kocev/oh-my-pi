@@ -898,9 +898,11 @@ export interface OAuthAccountIdentity {
 export type OAuthAccessResolution = ({ ok: true } & OAuthAccess) | ({ ok: false } & OAuthAccessFailure);
 
 /**
- * Read-only identity of one stored OAuth account, in stable storage order.
- * Returned by {@link AuthStorage.listOAuthAccounts}; `position` (0-based) is the
- * selector accepted by {@link AuthStorage.getOAuthAccessAt}.
+ * Read-only identity of one stored OAuth account. Returned by
+ * {@link AuthStorage.listOAuthAccounts} in user-defined priority order (top =
+ * highest priority) when a subscription order is configured, otherwise in
+ * stable storage order. `position` (0-based) is the selector accepted by
+ * {@link AuthStorage.getOAuthAccessAt}.
  */
 export interface OAuthAccountSummary {
 	position: number;
@@ -1336,6 +1338,17 @@ export class AuthStorage {
 	#usageRequestTimeoutMs: number;
 	#usageLogger?: UsageLogger;
 	#fallbackResolver?: (provider: string) => string | undefined;
+	/**
+	 * Optional user-defined priority order for a provider's OAuth accounts,
+	 * returned as ordered durable credential ids (first = highest priority =
+	 * active). Accounts appear in this order first; accounts not listed keep
+	 * their storage order after the ranked ones. It seeds the listing order and
+	 * the starting point of credential selection (replacing the session-hash /
+	 * round-robin rotation), but never picks the final account on its own:
+	 * rate-limit blocks, usage-limit handling, and the usage-aware ranking
+	 * comparator remain authoritative and may route past the top entry.
+	 */
+	#subscriptionOrderResolver?: (provider: string) => readonly number[] | undefined;
 	#store: AuthCredentialStore;
 	#configValueResolver: (config: string) => Promise<string | undefined>;
 	#refreshOAuthCredentialOverride?: AuthStorageOptions["refreshOAuthCredential"];
@@ -1563,6 +1576,47 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Set the user-defined OAuth-account priority order resolver. The resolver
+	 * returns a provider's ordered credential ids (first = highest priority =
+	 * active; see {@link #subscriptionOrderResolver}). Pass `undefined` to fall
+	 * back to storage order.
+	 */
+	setSubscriptionOrderResolver(resolver: ((provider: string) => readonly number[] | undefined) | undefined): void {
+		this.#subscriptionOrderResolver = resolver;
+	}
+
+	/**
+	 * Priority rank per credential id for `provider`, or `undefined` when no
+	 * order is configured. Lower rank wins; duplicate ids keep their first rank.
+	 */
+	#getSubscriptionOrderRank(provider: string): Map<number, number> | undefined {
+		const order = this.#subscriptionOrderResolver?.(provider);
+		if (!order || order.length === 0) return undefined;
+		const rank = new Map<number, number>();
+		for (const credentialId of order) {
+			if (!rank.has(credentialId)) rank.set(credentialId, rank.size);
+		}
+		return rank.size > 0 ? rank : undefined;
+	}
+
+	/**
+	 * Stable-sort credential-id-bearing entries by the user-defined priority
+	 * order. Entries whose id is not ranked keep their original relative order
+	 * after the ranked ones. Callers rely on the sort being stable so the
+	 * durable `.index`/`credentialId` each entry carries stays attached — only
+	 * the visiting order changes, never credential identity.
+	 */
+	#sortBySubscriptionOrder<T extends { credentialId: number }>(provider: string, entries: T[]): T[] {
+		const rank = this.#getSubscriptionOrderRank(provider);
+		if (!rank) return entries;
+		const unranked = rank.size;
+		return entries
+			.map((entry, index) => ({ entry, index, key: rank.get(entry.credentialId) ?? unranked }))
+			.sort((left, right) => left.key - right.key || left.index - right.index)
+			.map(ranked => ranked.entry);
+	}
+
+	/**
 	 * Reload credentials from storage.
 	 */
 	async reload(): Promise<void> {
@@ -1748,16 +1802,29 @@ export class AuthStorage {
 	}
 
 	/**
-	 * Returns credential indices in priority order for selection.
-	 * With sessionId: starts from hashed index (consistent per session).
-	 * Without sessionId: starts from round-robin index (load balancing).
-	 * Order wraps around so all credentials are tried if earlier ones are blocked.
+	 * Returns credential indices in visiting order for selection, wrapping around
+	 * so every credential is still tried when earlier ones are blocked.
+	 *
+	 * `preferFirst` means the caller's array is already sorted by the user's
+	 * priority order, so selection starts at its top entry instead of a rotation
+	 * slot — load balancing is not what the user asked for once they ranked their
+	 * accounts. Otherwise, with a sessionId the start is the hashed index (same
+	 * session, same credential); without one it is the round-robin index (load
+	 * balancing). `preferFirst` deliberately leaves the round-robin cursor
+	 * untouched: it is not consuming a slot.
 	 */
-	#getCredentialOrder(providerKey: string, sessionId: string | undefined, total: number): number[] {
+	#getCredentialOrder(
+		providerKey: string,
+		sessionId: string | undefined,
+		total: number,
+		preferFirst = false,
+	): number[] {
 		if (total <= 1) return [0];
-		const start = sessionId
-			? this.#getHashedIndex(sessionId, total)
-			: this.#getNextRoundRobinIndex(providerKey, total);
+		const start = preferFirst
+			? 0
+			: sessionId
+				? this.#getHashedIndex(sessionId, total)
+				: this.#getNextRoundRobinIndex(providerKey, total);
 		const order: number[] = [];
 		for (let i = 0; i < total; i++) {
 			order.push((start + i) % total);
@@ -2893,14 +2960,22 @@ export class AuthStorage {
 		// filtered array would be off-by-N when any non-OAuth credential precedes the
 		// OAuth ones (e.g. [api_key, oauth_A, oauth_B] stored order).
 		const stickyCredential = sessionPref?.type === "oauth" ? allCredentials[sessionPref.index] : undefined;
-		return stickyCredential?.type === "oauth" ? stickyCredential : oauthCredentials[0];
+		if (stickyCredential?.type === "oauth") return stickyCredential;
+		// No sticky yet: report the account the user ranked first, so every "which
+		// account am I on" read (status line, /usage header, account_uuid
+		// attribution) agrees with listOAuthAccounts()[0] during the window before
+		// this session resolves or pins a credential. Consulting the sorted listing
+		// only when an order exists keeps the common path allocation-free.
+		if (this.#getSubscriptionOrderRank(provider) === undefined) return oauthCredentials[0];
+		return this.#getStoredOAuthSelections(provider)[0]?.credential;
 	}
 
 	/**
 	 * Get the OAuth `accountId` for a provider, preferring the credential that is
 	 * session-sticky for `sessionId` when multiple OAuth credentials are configured.
-	 * Falls back to the first OAuth credential when no session preference exists (e.g.
-	 * first call before any `getApiKey` has been issued, or single-credential setups).
+	 * Falls back to the priority-top OAuth credential when no session preference
+	 * exists (e.g. first call before any `getApiKey` has been issued, or
+	 * single-credential setups).
 	 * Returns `undefined` when no OAuth credential carries an `accountId`.
 	 */
 	getOAuthAccountId(provider: string, sessionId?: string): string | undefined {
@@ -4850,14 +4925,21 @@ export class AuthStorage {
 		sessionId?: string,
 		options?: AuthApiKeyOptions,
 	): Promise<OAuthResolutionResult | undefined> {
-		const credentials = this.#getCredentialsForProvider(provider)
-			.map((credential, index) => ({ credential, index }))
-			.filter((entry): entry is { credential: OAuthCredential; index: number } => entry.credential.type === "oauth");
+		const credentials = this.#getStoredOAuthSelections(provider);
 
 		if (credentials.length === 0) return undefined;
 
 		const providerKey = this.#getProviderTypeKey(provider, "oauth");
-		const order = this.#getCredentialOrder(providerKey, sessionId, credentials.length);
+		// `credentials` is already priority-sorted; when the user configured an
+		// order, start at its top entry rather than rotating into an arbitrary
+		// slot — otherwise the order would be cosmetic for providers with no
+		// ranking strategy, whose candidate list is exactly this visiting order.
+		const order = this.#getCredentialOrder(
+			providerKey,
+			sessionId,
+			credentials.length,
+			this.#getSubscriptionOrderRank(provider) !== undefined,
+		);
 		const strategy = this.#rankingStrategyResolver?.(provider);
 		const rankingContext: CredentialRankingContext = { modelId: options?.modelId };
 		const blockScope = strategy?.blockScope?.(rankingContext);
@@ -4924,7 +5006,7 @@ export class AuthStorage {
 				})
 			: order
 					.map(idx => credentials[idx])
-					.filter((selection): selection is { credential: OAuthCredential; index: number } => Boolean(selection))
+					.filter((selection): selection is StoredOAuthSelection => Boolean(selection))
 					.map(selection => ({ selection, usage: null, usageChecked: false }));
 		const preflightFailures = new Set<OAuthCandidate>();
 
@@ -5738,11 +5820,18 @@ export class AuthStorage {
 		};
 	}
 
-	/** Stored OAuth credentials for `provider` in stable order, paired with their full-list index and row id. */
+	/**
+	 * Stored OAuth credentials for `provider` paired with their durable full-list
+	 * `index` and row id. Ordered by the user-defined subscription priority (top
+	 * = highest priority) when one is configured, otherwise in stable storage
+	 * order. The `index` stays the credential's position in the unsorted store so
+	 * block/pin bookkeeping keyed on it is unaffected by reordering.
+	 */
 	#getStoredOAuthSelections(provider: string): StoredOAuthSelection[] {
-		return this.#getStoredCredentials(provider)
+		const selections = this.#getStoredCredentials(provider)
 			.map((entry, index) => ({ credentialId: entry.id, credential: entry.credential, index }))
 			.filter((entry): entry is StoredOAuthSelection => entry.credential.type === "oauth");
+		return this.#sortBySubscriptionOrder(provider, selections);
 	}
 
 	/** Refresh one stored OAuth selection and shape it as an {@link OAuthAccessResolution}. */
@@ -5802,10 +5891,19 @@ export class AuthStorage {
 	}
 
 	/**
-	 * Read-only list of stored OAuth accounts for `provider` in stable storage
-	 * order, WITHOUT refreshing any token. The array position (0-based) is the
-	 * selector accepted by {@link AuthStorage.getOAuthAccessAt}; a "pick the Nth
-	 * account" UI should render `position + 1`.
+	 * Read-only list of stored OAuth accounts for `provider`, WITHOUT refreshing
+	 * any token. Ordered by the user-defined subscription priority (top = highest
+	 * priority) when configured, otherwise in stable storage order. The array
+	 * position (0-based) is the selector accepted by
+	 * {@link AuthStorage.getOAuthAccessAt}; a "pick the Nth account" UI should
+	 * render `position + 1`.
+	 *
+	 * `position` is only meaningful against the ordering installed on THIS
+	 * instance — the priority order comes from the embedder-installed
+	 * {@link AuthStorage.setSubscriptionOrderResolver}, so two instances over the
+	 * same store can number the same accounts differently. Compare positions only
+	 * against a listing taken from the same instance; `credentialId` is the
+	 * durable handle to persist or hand to another instance.
 	 *
 	 * When `sessionId` is supplied, the session-sticky OAuth credential is marked
 	 * `active`. No account is active before that session has resolved or pinned a
@@ -5889,6 +5987,12 @@ export class AuthStorage {
 	 * false`), so — unlike {@link AuthStorage.getOAuthAccesses} — a definitive
 	 * failure of the targeted account surfaces as a failed resolution rather than
 	 * silently rotating or rate-tripping a sibling.
+	 *
+	 * `position` indexes the priority order installed on THIS instance (see
+	 * {@link AuthStorage.listOAuthAccounts}), so it is only valid against a
+	 * listing taken from the same instance. Use
+	 * {@link AuthStorage.getOAuthAccessByCredentialId} for a handle that survives
+	 * reordering and instance boundaries.
 	 *
 	 * Returns `undefined` when `position` is out of range or runtime/config
 	 * overrides have replaced OAuth with an explicit API key.

@@ -103,6 +103,7 @@ import { renderSegmentTrack } from "../components/segment-track";
 import { SessionAccountSelectorComponent } from "../components/session-account-selector";
 import { SessionSelectorComponent, type SessionSelectorOptions } from "../components/session-selector";
 import { SettingsSelectorComponent } from "../components/settings-selector";
+import { SubscriptionOrderSelectorComponent } from "../components/subscription-order-selector";
 import { ToolExecutionComponent } from "../components/tool-execution";
 import { TranscriptBlock } from "../components/transcript-container";
 import { TreeSelectorComponent } from "../components/tree-selector";
@@ -2083,6 +2084,50 @@ export class SelectorController {
 					this.ctx.ui.requestRender();
 				},
 			);
+			return { component: selector, focus: selector };
+		});
+	}
+
+	async showSubscriptionOrderSelector(): Promise<void> {
+		const session = this.ctx.session;
+		this.ctx.showStatus("Loading provider accounts…", { dim: true });
+		let accountList: SessionOAuthAccountList | undefined;
+		try {
+			accountList = await session.listCurrentProviderOAuthAccounts();
+		} catch (error) {
+			this.ctx.showError(
+				`Could not load provider accounts: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return;
+		}
+		if (!accountList) {
+			this.ctx.showStatus("Select a model before ordering provider accounts.");
+			return;
+		}
+		const provider = getOAuthProviders().find(candidate => candidate.id === accountList.provider);
+		const providerName = provider?.name ?? accountList.provider;
+		const accounts = toSessionPinAccounts(accountList.accounts);
+		if (accounts.length < 2) {
+			this.ctx.showStatus(
+				accounts.length === 0
+					? `No OAuth accounts for ${providerName}. Use /login to add one.`
+					: `Only one OAuth account for ${providerName} — nothing to order.`,
+			);
+			return;
+		}
+
+		this.showSelector(done => {
+			const selector = new SubscriptionOrderSelectorComponent(providerName, accounts, credentialIds => {
+				done();
+				if (credentialIds) {
+					session.setCurrentProviderSubscriptionOrder(credentialIds);
+					this.ctx.showStatus(`Saved ${providerName} account priority order.`);
+				} else {
+					this.ctx.showStatus(`No changes to ${providerName} account order.`);
+				}
+				this.ctx.statusLine.invalidate();
+				this.ctx.ui.requestRender();
+			});
 			return { component: selector, focus: selector };
 		});
 	}

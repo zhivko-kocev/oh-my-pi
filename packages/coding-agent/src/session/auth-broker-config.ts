@@ -32,6 +32,7 @@ import {
 import { MissingApiKeyError } from "@oh-my-pi/pi-ai/error";
 import { getAgentDir } from "@oh-my-pi/pi-utils";
 import { resolveConfigValue } from "../config/resolve-config-value";
+import { settings } from "../config/settings";
 import type { AuthStorage } from "./auth-storage";
 
 export { type AuthBrokerClientConfig, getAuthBrokerTokenFilePath };
@@ -90,6 +91,20 @@ export function discoverAuthStorage(
 		...options,
 		agentDir,
 		configValueResolver: resolveConfigValue,
+	}).then(authStorage => {
+		// Single install point: every AuthStorage in the process comes from here, so
+		// the configured subscription order reaches the TUI, the SDK, and every CLI
+		// path — including `omp token --list`, which runs before any ModelRegistry
+		// exists. Read lazily and defensively because settings are not initialized
+		// this early in some entrypoints, and the module proxy throws until they are.
+		authStorage.setSubscriptionOrderResolver(provider => {
+			try {
+				return settings.get("auth.subscriptionOrder")?.[provider];
+			} catch {
+				return undefined;
+			}
+		});
+		return authStorage;
 	});
 }
 

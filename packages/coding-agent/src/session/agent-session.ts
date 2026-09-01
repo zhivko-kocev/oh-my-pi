@@ -9410,6 +9410,20 @@ export class AgentSession {
 	}
 
 	/**
+	 * Persist the OAuth-account priority order for the current model provider.
+	 * `credentialIds` are {@link OAuthAccountSummary.credentialId} values in the
+	 * desired order (first = highest priority / default). Unlisted accounts keep
+	 * their storage order after the ranked ones. Returns the provider on success,
+	 * or `undefined` when no model provider is selected.
+	 */
+	setCurrentProviderSubscriptionOrder(credentialIds: readonly number[]): string | undefined {
+		const provider = this.model?.provider;
+		if (!provider) return undefined;
+		this.settings.setSubscriptionOrder(provider, credentialIds);
+		return provider;
+	}
+
+	/**
 	 * Redeem one saved Codex rate-limit reset for a specific account, injecting
 	 * the provider base URL like {@link AgentSession.fetchUsageReports}. Powers
 	 * the `/usage reset` command and auto-redeem. Never throws for business

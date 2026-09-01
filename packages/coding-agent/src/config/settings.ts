@@ -470,6 +470,9 @@ export class Settings {
 	/** On-disk generations and prior values observed before each pending global mutation. */
 	#modifiedPathMutations = new Map<string, PendingYamlMutation>();
 	#modifiedGlobalModelRoleMutations = new Map<string, PendingYamlMutation>();
+	/** Individual global subscription-order providers modified during this session (for partial save) */
+	#modifiedGlobalSubscriptionOrders = new Set<string>();
+	#modifiedGlobalSubscriptionOrderMutations = new Map<string, PendingYamlMutation>();
 	/** Changes whenever a live API mutates a persisted layer. */
 	#persistedMutationGeneration = 0;
 	/**
@@ -733,7 +736,11 @@ export class Settings {
 		if (this.#projectSavePromise) {
 			await this.#projectSavePromise;
 		}
-		if (this.#modified.size > 0 || this.#modifiedGlobalModelRoles.size > 0) {
+		if (
+			this.#modified.size > 0 ||
+			this.#modifiedGlobalModelRoles.size > 0 ||
+			this.#modifiedGlobalSubscriptionOrders.size > 0
+		) {
 			await this.#saveNow();
 		}
 		if (this.#modifiedProjectModelRoles.size > 0) {
@@ -1001,6 +1008,53 @@ export class Settings {
 			}
 		}
 		return roles;
+	}
+
+	#subscriptionOrdersFromLayer(layer: RawSettings): Record<string, number[]> {
+		const value = getByPath(layer, ["auth", "subscriptionOrder"]);
+		if (!isRecord(value)) return {};
+
+		const orders: Record<string, number[]> = {};
+		for (const provider in value) {
+			if (!Object.hasOwn(value, provider)) continue;
+			const entry = value[provider];
+			if (!Array.isArray(entry)) continue;
+			// A hand-edited file can hold anything; keep only usable credential ids.
+			orders[provider] = entry.filter((id): id is number => typeof id === "number" && Number.isInteger(id));
+		}
+		return orders;
+	}
+
+	/**
+	 * Persist the OAuth-account priority order for `provider`. An empty
+	 * `credentialIds` drops the provider's entry so readers see the same
+	 * "no configured order" state they see before the first write.
+	 *
+	 * Persists per provider rather than marking the whole `auth.subscriptionOrder`
+	 * path modified: #saveNow merges only the changed provider into the re-read
+	 * file, so another live instance's order for a sibling provider is not
+	 * clobbered by this process's stale in-memory snapshot.
+	 */
+	setSubscriptionOrder(provider: string, credentialIds: readonly number[]): void {
+		// Assigning these on the plain record would replace a prototype member
+		// instead of adding an entry, corrupting the whole record object.
+		if (provider === "__proto__" || provider === "constructor" || provider === "prototype") {
+			logger.warn("Settings: ignored subscription order for reserved provider key", { provider });
+			return;
+		}
+
+		const current = this.#subscriptionOrdersFromLayer(this.#global);
+		this.#captureGlobalMutation(provider, this.#modifiedGlobalSubscriptionOrderMutations, current[provider]);
+		if (credentialIds.length === 0) {
+			delete current[provider];
+		} else {
+			current[provider] = [...credentialIds];
+		}
+		setByPath(this.#global, ["auth", "subscriptionOrder"], current);
+		this.#modifiedGlobalSubscriptionOrders.add(provider);
+		this.#persistedMutationGeneration++;
+		this.#rebuildMerged();
+		this.#queueSave();
 	}
 
 	#modelRoleLayerOwns(layer: RawSettings, role: ModelRole | string): boolean {
@@ -2393,7 +2447,13 @@ export class Settings {
 
 	async #saveNow(): Promise<void> {
 		if (this.#savesCancelled || !this.#persist || !this.#configPath) return;
-		if (this.#modified.size === 0 && this.#modifiedGlobalModelRoles.size === 0) return;
+		if (
+			this.#modified.size === 0 &&
+			this.#modifiedGlobalModelRoles.size === 0 &&
+			this.#modifiedGlobalSubscriptionOrders.size === 0
+		) {
+			return;
+		}
 
 		const configPath = this.#configPath;
 		const modifiedPaths = [...this.#modified];
@@ -2401,6 +2461,9 @@ export class Settings {
 		const modifiedPathMutations = new Map(this.#modifiedPathMutations);
 		const modifiedModelRoleMutations = new Map(this.#modifiedGlobalModelRoleMutations);
 		const globalRolesAtStart = this.#modelRolesFromLayer(this.#global);
+		const modifiedSubscriptionOrders = [...this.#modifiedGlobalSubscriptionOrders];
+		const modifiedSubscriptionOrderMutations = new Map(this.#modifiedGlobalSubscriptionOrderMutations);
+		const globalOrdersAtStart = this.#subscriptionOrdersFromLayer(this.#global);
 		const previousSignaledValues = {
 			modelRoles: this.get("modelRoles"),
 			sessionAccent: this.get("statusLine.sessionAccent"),
@@ -2414,6 +2477,8 @@ export class Settings {
 		this.#modifiedGlobalModelRoles.clear();
 		this.#modifiedPathMutations.clear();
 		this.#modifiedGlobalModelRoleMutations.clear();
+		this.#modifiedGlobalSubscriptionOrders.clear();
+		this.#modifiedGlobalSubscriptionOrderMutations.clear();
 
 		try {
 			await this.#withYamlWriteLock(configPath, async writePath => {
@@ -2498,6 +2563,58 @@ export class Settings {
 					shouldWrite = true;
 				}
 
+				// Merge the subscription orders captured by this save the same
+				// way, so a provider order written by another live instance is
+				// not clobbered by this process's stale in-memory snapshot.
+				// These values are arrays, so they compare structurally.
+				const latestGlobalOrders = this.#subscriptionOrdersFromLayer(this.#global);
+				const ordersToPreserve = new Set(this.#modifiedGlobalSubscriptionOrders);
+				for (const provider in globalOrdersAtStart) {
+					if (!Bun.deepEquals(globalOrdersAtStart[provider], latestGlobalOrders[provider])) {
+						ordersToPreserve.add(provider);
+					}
+				}
+				for (const provider in latestGlobalOrders) {
+					if (!Bun.deepEquals(globalOrdersAtStart[provider], latestGlobalOrders[provider])) {
+						ordersToPreserve.add(provider);
+					}
+				}
+				const currentOrders = getByPath(current, ["auth", "subscriptionOrder"]);
+				const currentOrderValues: Record<string, unknown> = isRecord(currentOrders) ? currentOrders : {};
+				const ordersToApply = modifiedSubscriptionOrders.filter(provider => {
+					const mutation = modifiedSubscriptionOrderMutations.get(provider);
+					const canApply =
+						mutation !== undefined &&
+						mutation.generation.kind !== "unreadable" &&
+						(yamlGenerationsMatch(mutation.generation, loaded.generation) ||
+							Bun.deepEquals(currentOrderValues[provider], mutation.baseValue));
+					if (canApply) return true;
+					logger.warn("Settings: skipped stale change after external config edit", {
+						path: configPath,
+						setting: `auth.subscriptionOrder.${provider}`,
+					});
+					return false;
+				});
+				if (ordersToApply.length > 0 || ordersToPreserve.size > 0) {
+					const mergedOrders: Record<string, unknown> = { ...currentOrderValues };
+					for (const provider of ordersToApply) {
+						if (Object.hasOwn(globalOrdersAtStart, provider)) {
+							mergedOrders[provider] = globalOrdersAtStart[provider];
+						} else {
+							delete mergedOrders[provider];
+						}
+					}
+					for (const provider of ordersToPreserve) {
+						if (Object.hasOwn(latestGlobalOrders, provider)) {
+							mergedOrders[provider] = latestGlobalOrders[provider];
+						} else {
+							delete mergedOrders[provider];
+						}
+					}
+					setByPath(current, ["auth", "subscriptionOrder"], mergedOrders);
+					shouldWrite = true;
+				}
+
 				// Update our global with any external changes we preserved.
 				this.#global = current;
 				if (shouldWrite) {
@@ -2511,6 +2628,14 @@ export class Settings {
 					if (latestGlobalRoles[role] === globalRolesAfterWrite[role]) {
 						this.#modifiedGlobalModelRoles.delete(role);
 						this.#modifiedGlobalModelRoleMutations.delete(role);
+					}
+				}
+				// Same for the subscription orders this write covered.
+				const globalOrdersAfterWrite = this.#subscriptionOrdersFromLayer(this.#global);
+				for (const provider of ordersToPreserve) {
+					if (Bun.deepEquals(latestGlobalOrders[provider], globalOrdersAfterWrite[provider])) {
+						this.#modifiedGlobalSubscriptionOrders.delete(provider);
+						this.#modifiedGlobalSubscriptionOrderMutations.delete(provider);
 					}
 				}
 			});
@@ -2544,6 +2669,19 @@ export class Settings {
 					};
 					this.#modifiedGlobalModelRoleMutations.set(
 						role,
+						retryGeneration ? { ...mutation, generation: retryGeneration } : mutation,
+					);
+				}
+			}
+			for (const provider of modifiedSubscriptionOrders) {
+				this.#modifiedGlobalSubscriptionOrders.add(provider);
+				if (!this.#modifiedGlobalSubscriptionOrderMutations.has(provider)) {
+					const mutation = modifiedSubscriptionOrderMutations.get(provider) ?? {
+						generation: { kind: "unreadable" },
+						baseValue: undefined,
+					};
+					this.#modifiedGlobalSubscriptionOrderMutations.set(
+						provider,
 						retryGeneration ? { ...mutation, generation: retryGeneration } : mutation,
 					);
 				}
